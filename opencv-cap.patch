@@ -1,7 +1,7 @@
-diff --git a/src/opencv-3.4.14/modules/videoio/src/cap.cpp b/src/opencv-3.4.14/modules/videoio/src/cap.cpp
+diff --git a/opencv-3.4.14/modules/videoio/src/cap.cpp b/opencv-3.4.14/modules/videoio/src/cap.cpp
 index 3633970..29ba6e3 100644
---- a/src/opencv-3.4.14/modules/videoio/src/cap.cpp
-+++ b/src/opencv-3.4.14/modules/videoio/src/cap.cpp
+--- a/opencv-3.4.14/modules/videoio/src/cap.cpp
++++ b/opencv-3.4.14/modules/videoio/src/cap.cpp
 @@ -40,11 +40,23 @@
  //M*/
  
