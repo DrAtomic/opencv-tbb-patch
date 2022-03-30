@@ -882,10 +882,10 @@ index 3633970..29ba6e3 100644
  
 -} // namespace
 +}
-diff --git a/src/opencv-3.4.14/modules/videoio/src/cap_dshow.cpp b/src/opencv-3.4.14/modules/videoio/src/cap_dshow.cpp
+diff --git a/modules/videoio/src/cap_dshow.cpp b/modules/videoio/src/cap_dshow.cpp
 index cf653f6..fae806c 100644
---- a/src/opencv-3.4.14/modules/videoio/src/cap_dshow.cpp
-+++ b/src/opencv-3.4.14/modules/videoio/src/cap_dshow.cpp
+--- a/modules/videoio/src/cap_dshow.cpp
++++ b/modules/videoio/src/cap_dshow.cpp
 @@ -41,7 +41,7 @@
  
  #include "precomp.hpp"
