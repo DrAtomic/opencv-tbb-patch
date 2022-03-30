@@ -1,0 +1,2538 @@
+diff --git a/src/opencv-3.4.14/modules/videoio/src/cap.cpp b/src/opencv-3.4.14/modules/videoio/src/cap.cpp
+index 3633970..29ba6e3 100644
+--- a/src/opencv-3.4.14/modules/videoio/src/cap.cpp
++++ b/src/opencv-3.4.14/modules/videoio/src/cap.cpp
+@@ -40,11 +40,23 @@
+ //M*/
+ 
+ #include "precomp.hpp"
++#include "cap_intelperc.hpp"
++#include "cap_dshow.hpp"
++
++// All WinRT versions older than 8.0 should provide classes used for video support
++#if defined(WINRT) && !defined(WINRT_8_0)
++#   include "cap_winrt_capture.hpp"
++#   include "cap_winrt_bridge.hpp"
++#   define WINRT_VIDEO
++#endif
+ 
+-#include "opencv2/videoio/registry.hpp"
+-#include "videoio_registry.hpp"
++#if defined _M_X64 && defined _MSC_VER && !defined CV_ICC
++#pragma optimize("",off)
++#pragma warning(disable: 4748)
++#endif
+ 
+-namespace cv {
++namespace cv
++{
+ 
+ template<> void DefaultDeleter<CvCapture>::operator ()(CvCapture* obj) const
+ { cvReleaseCapture(&obj); }
+@@ -52,159 +64,557 @@ template<> void DefaultDeleter<CvCapture>::operator ()(CvCapture* obj) const
+ template<> void DefaultDeleter<CvVideoWriter>::operator ()(CvVideoWriter* obj) const
+ { cvReleaseVideoWriter(&obj); }
+ 
++}
+ 
++/************************* Reading AVIs & Camera data **************************/
+ 
+-VideoCapture::VideoCapture()
+-{}
++static inline double icvGetCaptureProperty( const CvCapture* capture, int id )
++{
++    return capture ? capture->getProperty(id) : 0;
++}
+ 
+-VideoCapture::VideoCapture(const String& filename, int apiPreference)
++CV_IMPL void cvReleaseCapture( CvCapture** pcapture )
+ {
+-    CV_TRACE_FUNCTION();
+-    open(filename, apiPreference);
++    if( pcapture && *pcapture )
++    {
++        delete *pcapture;
++        *pcapture = 0;
++    }
+ }
+ 
+-VideoCapture::VideoCapture(const String& filename)
++CV_IMPL IplImage* cvQueryFrame( CvCapture* capture )
+ {
+-    CV_TRACE_FUNCTION();
+-    open(filename, CAP_ANY);
++    if(!capture)
++        return 0;
++    if(!capture->grabFrame())
++        return 0;
++    return capture->retrieveFrame(0);
+ }
+ 
+-VideoCapture::VideoCapture(int index)
++
++CV_IMPL int cvGrabFrame( CvCapture* capture )
+ {
+-    CV_TRACE_FUNCTION();
+-    open(index);
++    return capture ? capture->grabFrame() : 0;
+ }
+ 
+-VideoCapture::VideoCapture(int index, int apiPreference)
++CV_IMPL IplImage* cvRetrieveFrame( CvCapture* capture, int idx )
+ {
+-    CV_TRACE_FUNCTION();
+-    open(index, apiPreference);
++    return capture ? capture->retrieveFrame(idx) : 0;
+ }
+ 
+-VideoCapture::~VideoCapture()
++CV_IMPL double cvGetCaptureProperty( CvCapture* capture, int id )
+ {
+-    CV_TRACE_FUNCTION();
++    return icvGetCaptureProperty(capture, id);
++}
+ 
+-    icap.release();
+-    cap.release();
++CV_IMPL int cvSetCaptureProperty( CvCapture* capture, int id, double value )
++{
++    return capture ? capture->setProperty(id, value) : 0;
+ }
+ 
+-bool VideoCapture::open(const String& filename, int apiPreference)
++CV_IMPL int cvGetCaptureDomain( CvCapture* capture)
+ {
+-    CV_TRACE_FUNCTION();
++    return capture ? capture->getCaptureDomain() : 0;
++}
+ 
+-    if (isOpened()) release();
+ 
+-    const std::vector<VideoBackendInfo> backends = cv::videoio_registry::getAvailableBackends_CaptureByFilename();
+-    for (size_t i = 0; i < backends.size(); i++)
++/**
++ * Camera dispatching method: index is the camera number.
++ * If given an index from 0 to 99, it tries to find the first
++ * API that can access a given camera index.
++ * Add multiples of 100 to select an API.
++ */
++CV_IMPL CvCapture * cvCreateCameraCapture (int index)
++{
++    // interpret preferred interface (0 = autodetect)
++    int pref = (index / 100) * 100;
++
++    // remove pref from index
++    index -= pref;
++
++    // local variable to memorize the captured device
++    CvCapture *capture = 0;
++
++    switch (pref)
+     {
+-        const VideoBackendInfo& info = backends[i];
+-        if (apiPreference == CAP_ANY || apiPreference == info.id)
+-        {
+-            CvCapture* capture = NULL;
+-            VideoCapture_create(capture, icap, info.id, filename);
+-            if (!icap.empty())
+-            {
+-                if (icap->isOpened())
+-                    return true;
+-                icap.release();
+-            }
+-            if (capture)
+-            {
+-                cap.reset(capture);
+-                // assume it is opened
+-                return true;
+-            }
+-        }
++    default:
++        // user specified an API we do not know
++        // bail out to let the user know that it is not available
++        if (pref) break;
++#ifdef HAVE_DSHOW
++    case CV_CAP_DSHOW:
++        if (!capture)
++            capture = cvCreateCameraCapture_DShow(index);
++        if (pref) break;
++#endif
++#ifdef HAVE_MSMF
++    case CV_CAP_MSMF:
++        if (!capture)
++            capture = cvCreateCameraCapture_MSMF(index);
++        if (pref) break;
++#endif
++#ifdef HAVE_TYZX
++    case CV_CAP_STEREO:
++        if (!capture)
++            capture = cvCreateCameraCapture_TYZX(index);
++        if (pref) break;
++#endif
++    case CV_CAP_VFW:
++#ifdef HAVE_VFW
++        if (!capture)
++            capture = cvCreateCameraCapture_VFW(index);
++#endif
++#if defined HAVE_LIBV4L || defined HAVE_CAMV4L || defined HAVE_CAMV4L2 || defined HAVE_VIDEOIO
++        if (!capture)
++            capture = cvCreateCameraCapture_V4L(index);
++#endif
++
++#ifdef HAVE_GSTREAMER
++        if (!capture)
++            capture = cvCreateCapture_GStreamer(CV_CAP_GSTREAMER_V4L2, 0);
++
++        if (!capture)
++            capture = cvCreateCapture_GStreamer(CV_CAP_GSTREAMER_V4L, 0);
++#endif
++        if (pref) break; // CV_CAP_VFW
++
++    case CV_CAP_FIREWIRE:
++#ifdef HAVE_DC1394_2
++        if (!capture)
++            capture = cvCreateCameraCapture_DC1394_2(index);
++#endif
++
++#ifdef HAVE_DC1394
++        if (!capture)
++            capture = cvCreateCameraCapture_DC1394(index);
++#endif
++
++#ifdef HAVE_CMU1394
++        if (!capture)
++            capture = cvCreateCameraCapture_CMU(index);
++#endif
++
++#if defined(HAVE_GSTREAMER) && 0
++        // Re-enable again when gstreamer 1394 support will land in the backend code
++        if (!capture)
++            capture = cvCreateCapture_GStreamer(CV_CAP_GSTREAMER_1394, 0);
++#endif
++        if (pref) break; // CV_CAP_FIREWIRE
++
++#ifdef HAVE_MIL
++    case CV_CAP_MIL:
++        if (!capture)
++            capture = cvCreateCameraCapture_MIL(index);
++        if (pref) break;
++#endif
++
++#if defined(HAVE_QUICKTIME) || defined(HAVE_QTKIT)
++    case CV_CAP_QT:
++        if (!capture)
++            capture = cvCreateCameraCapture_QT(index);
++        if (pref) break;
++#endif
++
++#ifdef HAVE_UNICAP
++    case CV_CAP_UNICAP:
++        if (!capture)
++            capture = cvCreateCameraCapture_Unicap(index);
++        if (pref) break;
++#endif
++
++#ifdef HAVE_PVAPI
++    case CV_CAP_PVAPI:
++        if (!capture)
++            capture = cvCreateCameraCapture_PvAPI(index);
++        if (pref) break;
++#endif
++
++#ifdef HAVE_OPENNI
++    case CV_CAP_OPENNI:
++        if (!capture)
++            capture = cvCreateCameraCapture_OpenNI(index);
++        if (pref) break;
++#endif
++
++#ifdef HAVE_OPENNI2
++    case CV_CAP_OPENNI2:
++        if (!capture)
++            capture = cvCreateCameraCapture_OpenNI2(index);
++        if (pref) break;
++#endif
++
++#ifdef HAVE_XIMEA
++    case CV_CAP_XIAPI:
++        if (!capture)
++            capture = cvCreateCameraCapture_XIMEA(index);
++        if (pref) break;
++#endif
++
++#ifdef HAVE_AVFOUNDATION
++    case CV_CAP_AVFOUNDATION:
++        if (!capture)
++            capture = cvCreateCameraCapture_AVFoundation(index);
++        if (pref) break;
++#endif
++
++#ifdef HAVE_GIGE_API
++    case CV_CAP_GIGANETIX:
++        if (!capture)
++            capture = cvCreateCameraCapture_Giganetix(index);
++        if (pref) break; // CV_CAP_GIGANETIX
++#endif
+     }
+-    return false;
++
++    return capture;
+ }
+ 
+-bool VideoCapture::open(const String& filename)
++/**
++ * Videoreader dispatching method: it tries to find the first
++ * API that can access a given filename.
++ */
++CV_IMPL CvCapture * cvCreateFileCaptureWithPreference (const char * filename, int apiPreference)
+ {
+-    CV_TRACE_FUNCTION();
++    CvCapture * result = 0;
+ 
+-    return open(filename, CAP_ANY);
++    switch(apiPreference) {
++    default:
++        // user specified an API we do not know
++        // bail out to let the user know that it is not available
++        if (apiPreference) break;
++
++#ifdef HAVE_FFMPEG
++    case CV_CAP_FFMPEG:
++        if (! result)
++            result = cvCreateFileCapture_FFMPEG_proxy (filename);
++        if (apiPreference) break;
++#endif
++
++#ifdef HAVE_VFW
++    case CV_CAP_VFW:
++        if (! result)
++            result = cvCreateFileCapture_VFW (filename);
++        if (apiPreference) break;
++#endif
++
++    case CV_CAP_MSMF:
++#ifdef HAVE_MSMF
++        if (! result)
++            result = cvCreateFileCapture_MSMF (filename);
++#endif
++
++#ifdef HAVE_XINE
++        if (! result)
++            result = cvCreateFileCapture_XINE (filename);
++#endif
++        if (apiPreference) break;
++
++#ifdef HAVE_GSTREAMER
++    case CV_CAP_GSTREAMER:
++        if (! result)
++            result = cvCreateCapture_GStreamer (CV_CAP_GSTREAMER_FILE, filename);
++        if (apiPreference) break;
++#endif
++
++#if defined(HAVE_QUICKTIME) || defined(HAVE_QTKIT)
++    case CV_CAP_QT:
++        if (! result)
++            result = cvCreateFileCapture_QT (filename);
++        if (apiPreference) break;
++#endif
++
++#ifdef HAVE_AVFOUNDATION
++    case CV_CAP_AVFOUNDATION:
++        if (! result)
++            result = cvCreateFileCapture_AVFoundation (filename);
++        if (apiPreference) break;
++#endif
++
++#ifdef HAVE_OPENNI
++    case CV_CAP_OPENNI:
++        if (! result)
++            result = cvCreateFileCapture_OpenNI (filename);
++        if (apiPreference) break;
++#endif
++
++    case CV_CAP_IMAGES:
++        if (! result)
++            result = cvCreateFileCapture_Images (filename);
++    }
++
++    return result;
+ }
+ 
+-bool  VideoCapture::open(int cameraNum, int apiPreference)
++CV_IMPL CvCapture * cvCreateFileCapture (const char * filename)
+ {
+-    CV_TRACE_FUNCTION();
++    return cvCreateFileCaptureWithPreference(filename, CV_CAP_ANY);
++}
+ 
+-    if (isOpened()) release();
++/**
++ * Videowriter dispatching method: it tries to find the first
++ * API that can write a given stream.
++ */
++CV_IMPL CvVideoWriter* cvCreateVideoWriter( const char* filename, int fourcc,
++                                            double fps, CvSize frameSize, int is_color )
++{
++    //CV_FUNCNAME( "cvCreateVideoWriter" );
++
++    CvVideoWriter *result = 0;
++
++    if(!fourcc || !fps)
++        result = cvCreateVideoWriter_Images(filename);
++
++#ifdef HAVE_FFMPEG
++    if(!result)
++        result = cvCreateVideoWriter_FFMPEG_proxy (filename, fourcc, fps, frameSize, is_color);
++#endif
++
++#ifdef HAVE_VFW
++    if(!result)
++        result = cvCreateVideoWriter_VFW(filename, fourcc, fps, frameSize, is_color);
++#endif
++
++#ifdef HAVE_MSMF
++    if (!result)
++        result = cvCreateVideoWriter_MSMF(filename, fourcc, fps, frameSize, is_color);
++#endif
++
++/*  #ifdef HAVE_XINE
++    if(!result)
++        result = cvCreateVideoWriter_XINE(filename, fourcc, fps, frameSize, is_color);
++    #endif
++*/
++#ifdef HAVE_AVFOUNDATION
++    if (! result)
++        result = cvCreateVideoWriter_AVFoundation(filename, fourcc, fps, frameSize, is_color);
++#endif
++
++#if defined(HAVE_QUICKTIME) || defined(HAVE_QTKIT)
++    if(!result)
++        result = cvCreateVideoWriter_QT(filename, fourcc, fps, frameSize, is_color);
++#endif
++
++#ifdef HAVE_GSTREAMER
++    if (! result)
++        result = cvCreateVideoWriter_GStreamer(filename, fourcc, fps, frameSize, is_color);
++#endif
++
++#if !defined(HAVE_FFMPEG) && \
++    !defined(HAVE_VFW) && \
++    !defined(HAVE_MSMF) && \
++    !defined(HAVE_AVFOUNDATION) && \
++    !defined(HAVE_QUICKTIME) && \
++    !defined(HAVE_QTKIT) && \
++    !defined(HAVE_GSTREAMER)
++// If none of the writers is used
++// these statements suppress 'unused parameter' warnings.
++    (void)frameSize;
++    (void)is_color;
++#endif
++
++    if(!result)
++        result = cvCreateVideoWriter_Images(filename);
++
++    return result;
++}
++
++CV_IMPL int cvWriteFrame( CvVideoWriter* writer, const IplImage* image )
++{
++    return writer ? writer->writeFrame(image) : 0;
++}
+ 
+-    if (apiPreference == CAP_ANY)
++CV_IMPL void cvReleaseVideoWriter( CvVideoWriter** pwriter )
++{
++    if( pwriter && *pwriter )
++    {
++        delete *pwriter;
++        *pwriter = 0;
++    }
++}
++
++namespace cv
++{
++
++static Ptr<IVideoCapture> IVideoCapture_create(int index)
++{
++    int  domains[] =
++    {
++#ifdef HAVE_DSHOW
++        CV_CAP_DSHOW,
++#endif
++#ifdef HAVE_INTELPERC
++        CV_CAP_INTELPERC,
++#endif
++#ifdef WINRT_VIDEO
++        CAP_WINRT,
++#endif
++#ifdef HAVE_GPHOTO2
++        CV_CAP_GPHOTO2,
++#endif
++        -1, -1
++    };
++
++    // interpret preferred interface (0 = autodetect)
++    int pref = (index / 100) * 100;
++    if (pref)
+     {
+-        // interpret preferred interface (0 = autodetect)
+-        int backendID = (cameraNum / 100) * 100;
+-        if (backendID)
++        domains[0]=pref;
++        index %= 100;
++        domains[1]=-1;
++    }
++
++    // try every possibly installed camera API
++    for (int i = 0; domains[i] >= 0; i++)
++    {
++#if defined(HAVE_DSHOW)        || \
++    defined(HAVE_INTELPERC)    || \
++    defined(WINRT_VIDEO)       || \
++    defined(HAVE_GPHOTO2)      || \
++    (0)
++        Ptr<IVideoCapture> capture;
++
++        switch (domains[i])
+         {
+-            cameraNum %= 100;
+-            apiPreference = backendID;
++#ifdef HAVE_DSHOW
++            case CV_CAP_DSHOW:
++                capture = makePtr<VideoCapture_DShow>(index);
++                break; // CV_CAP_DSHOW
++#endif
++#ifdef HAVE_INTELPERC
++            case CV_CAP_INTELPERC:
++                capture = makePtr<VideoCapture_IntelPerC>();
++                break; // CV_CAP_INTEL_PERC
++#endif
++#ifdef WINRT_VIDEO
++        case CAP_WINRT:
++            capture = Ptr<IVideoCapture>(new cv::VideoCapture_WinRT(index));
++            if (capture)
++                return capture;
++            break; // CAP_WINRT
++#endif
++#ifdef HAVE_GPHOTO2
++            case CV_CAP_GPHOTO2:
++                capture = createGPhoto2Capture(index);
++                break;
++#endif
+         }
++        if (capture && capture->isOpened())
++            return capture;
++#endif
+     }
+ 
+-    const std::vector<VideoBackendInfo> backends = cv::videoio_registry::getAvailableBackends_CaptureByIndex();
+-    for (size_t i = 0; i < backends.size(); i++)
++    // failed open a camera
++    return Ptr<IVideoCapture>();
++}
++
++
++static Ptr<IVideoCapture> IVideoCapture_create(const String& filename)
++{
++    int  domains[] =
+     {
+-        const VideoBackendInfo& info = backends[i];
+-        if (apiPreference == CAP_ANY || apiPreference == info.id)
++        CV_CAP_ANY,
++#ifdef HAVE_GPHOTO2
++        CV_CAP_GPHOTO2,
++#endif
++        -1, -1
++    };
++
++    // try every possibly installed camera API
++    for (int i = 0; domains[i] >= 0; i++)
++    {
++        Ptr<IVideoCapture> capture;
++
++        switch (domains[i])
+         {
+-            CvCapture* capture = NULL;
+-            VideoCapture_create(capture, icap, info.id, cameraNum);
+-            if (!icap.empty())
+-            {
+-                if (icap->isOpened())
+-                    return true;
+-                icap.release();
+-            }
+-            if (capture)
+-            {
+-                cap.reset(capture);
+-                // assume it is opened
+-                return true;
+-            }
++        case CV_CAP_ANY:
++            capture = createMotionJpegCapture(filename);
++            break;
++#ifdef HAVE_GPHOTO2
++        case CV_CAP_GPHOTO2:
++            capture = createGPhoto2Capture(filename);
++            break;
++#endif
++        }
++
++        if (capture && capture->isOpened())
++        {
++            return capture;
+         }
+     }
+-    return false;
++    // failed open a camera
++    return Ptr<IVideoCapture>();
+ }
+ 
+-bool VideoCapture::open(int index)
++static Ptr<IVideoWriter> IVideoWriter_create(const String& filename, int _fourcc, double fps, Size frameSize, bool isColor)
++{
++    Ptr<IVideoWriter> iwriter;
++    if( _fourcc == CV_FOURCC('M', 'J', 'P', 'G') )
++        iwriter = createMotionJpegWriter(filename, fps, frameSize, isColor);
++    return iwriter;
++}
++
++VideoCapture::VideoCapture()
++{}
++
++VideoCapture::VideoCapture(const String& filename, int apiPreference)
+ {
+-    CV_TRACE_FUNCTION();
++    open(filename, apiPreference);
++}
+ 
+-    return open(index, CAP_ANY);
++VideoCapture::VideoCapture(const String& filename)
++{
++    open(filename, CAP_ANY);
+ }
+ 
+-bool VideoCapture::isOpened() const
++VideoCapture::VideoCapture(int index)
++{
++    open(index);
++}
++
++VideoCapture::~VideoCapture()
++{
++    icap.release();
++    cap.release();
++}
++
++bool VideoCapture::open(const String& filename, int apiPreference)
+ {
++    if (isOpened()) release();
++    icap = IVideoCapture_create(filename);
+     if (!icap.empty())
+-        return icap->isOpened();
+-    return !cap.empty();  // legacy interface doesn't support closed files
++        return true;
++
++    cap.reset(cvCreateFileCaptureWithPreference(filename.c_str(), apiPreference));
++    return isOpened();
+ }
+ 
+-String VideoCapture::getBackendName() const
++bool VideoCapture::open(const String& filename)
+ {
+-    int api = 0;
+-    if (icap)
+-        api = icap->isOpened() ? icap->getCaptureDomain() : 0;
+-    else if (cap)
+-        api = cap->getCaptureDomain();
+-    CV_Assert(api != 0);
+-    return cv::videoio_registry::getBackendName((VideoCaptureAPIs)api);
++    return open(filename, CAP_ANY);
++}
++
++bool VideoCapture::open(int index)
++{
++    if (isOpened()) release();
++    icap = IVideoCapture_create(index);
++    if (!icap.empty())
++        return true;
++    cap.reset(cvCreateCameraCapture(index));
++    return isOpened();
++}
++
++bool VideoCapture::isOpened() const
++{
++    return (!cap.empty() || !icap.empty());
+ }
+ 
+ void VideoCapture::release()
+ {
+-    CV_TRACE_FUNCTION();
+     icap.release();
+     cap.release();
+ }
+ 
+ bool VideoCapture::grab()
+ {
+-    CV_INSTRUMENT_REGION();
+-
+     if (!icap.empty())
+         return icap->grabFrame();
+     return cvGrabFrame(cap) != 0;
+@@ -212,8 +622,6 @@ bool VideoCapture::grab()
+ 
+ bool VideoCapture::retrieve(OutputArray image, int channel)
+ {
+-    CV_INSTRUMENT_REGION();
+-
+     if (!icap.empty())
+         return icap->retrieveFrame(channel, image);
+ 
+@@ -235,8 +643,6 @@ bool VideoCapture::retrieve(OutputArray image, int channel)
+ 
+ bool VideoCapture::read(OutputArray image)
+ {
+-    CV_INSTRUMENT_REGION();
+-
+     if(grab())
+         retrieve(image);
+     else
+@@ -247,7 +653,6 @@ bool VideoCapture::read(OutputArray image)
+ VideoCapture& VideoCapture::operator >> (Mat& image)
+ {
+ #ifdef WINRT_VIDEO
+-    // FIXIT grab/retrieve methods() should work too
+     if (grab())
+     {
+         if (retrieve(image))
+@@ -269,21 +674,18 @@ VideoCapture& VideoCapture::operator >> (Mat& image)
+ #else
+     read(image);
+ #endif
++
+     return *this;
+ }
+ 
+ VideoCapture& VideoCapture::operator >> (UMat& image)
+ {
+-    CV_INSTRUMENT_REGION();
+-
+     read(image);
+     return *this;
+ }
+ 
+ bool VideoCapture::set(int propId, double value)
+ {
+-    CV_CheckNE(propId, (int)CAP_PROP_BACKEND, "Can set read-only property");
+-
+     if (!icap.empty())
+         return icap->setProperty(propId, value);
+     return cvSetCaptureProperty(cap, propId, value) != 0;
+@@ -291,27 +693,12 @@ bool VideoCapture::set(int propId, double value)
+ 
+ double VideoCapture::get(int propId) const
+ {
+-    if (propId == CAP_PROP_BACKEND)
+-    {
+-        int api = 0;
+-        if (icap)
+-            api = icap->isOpened() ? icap->getCaptureDomain() : 0;
+-        else if (cap)
+-            api = cap->getCaptureDomain();
+-        if (api <= 0)
+-            return -1.0;
+-        return (double)api;
+-    }
+     if (!icap.empty())
+         return icap->getProperty(propId);
+-    return cap ? cap->getProperty(propId) : 0;
++    return icvGetCaptureProperty(cap, propId);
+ }
+ 
+ 
+-//=================================================================================================
+-
+-
+-
+ VideoWriter::VideoWriter()
+ {}
+ 
+@@ -320,12 +707,6 @@ VideoWriter::VideoWriter(const String& filename, int _fourcc, double fps, Size f
+     open(filename, _fourcc, fps, frameSize, isColor);
+ }
+ 
+-
+-VideoWriter::VideoWriter(const String& filename, int apiPreference, int _fourcc, double fps, Size frameSize, bool isColor)
+-{
+-    open(filename, apiPreference, _fourcc, fps, frameSize, isColor);
+-}
+-
+ void VideoWriter::release()
+ {
+     iwriter.release();
+@@ -339,38 +720,12 @@ VideoWriter::~VideoWriter()
+ 
+ bool VideoWriter::open(const String& filename, int _fourcc, double fps, Size frameSize, bool isColor)
+ {
+-    return open(filename, CAP_ANY, _fourcc, fps, frameSize, isColor);
+-}
+-
+-bool VideoWriter::open(const String& filename, int apiPreference, int _fourcc, double fps, Size frameSize, bool isColor)
+-{
+-    CV_INSTRUMENT_REGION();
+-
+     if (isOpened()) release();
+-
+-    const std::vector<VideoBackendInfo> backends = cv::videoio_registry::getAvailableBackends_Writer();
+-    for (size_t i = 0; i < backends.size(); i++)
+-    {
+-        const VideoBackendInfo& info = backends[i];
+-        if (apiPreference == CAP_ANY || apiPreference == info.id)
+-        {
+-            CvVideoWriter* writer_ = NULL;
+-            VideoWriter_create(writer_, iwriter, info.id, filename, _fourcc, fps, frameSize, isColor);
+-            if (!iwriter.empty())
+-            {
+-                if (iwriter->isOpened())
+-                    return true;
+-                iwriter.release();
+-            }
+-            if (writer_)
+-            {
+-                // assume it is opened
+-                writer.reset(writer_);
+-                return true;
+-            }
+-        }
+-    }
+-    return false;
++    iwriter = IVideoWriter_create(filename, _fourcc, fps, frameSize, isColor);
++    if (!iwriter.empty())
++        return true;
++    writer.reset(cvCreateVideoWriter(filename.c_str(), _fourcc, fps, frameSize, isColor));
++    return isOpened();
+ }
+ 
+ bool VideoWriter::isOpened() const
+@@ -381,8 +736,6 @@ bool VideoWriter::isOpened() const
+ 
+ bool VideoWriter::set(int propId, double value)
+ {
+-    CV_CheckNE(propId, (int)CAP_PROP_BACKEND, "Can set read-only property");
+-
+     if (!iwriter.empty())
+         return iwriter->setProperty(propId, value);
+     return false;
+@@ -390,58 +743,31 @@ bool VideoWriter::set(int propId, double value)
+ 
+ double VideoWriter::get(int propId) const
+ {
+-    if (propId == CAP_PROP_BACKEND)
+-    {
+-        int api = 0;
+-        if (iwriter)
+-            api = iwriter->getCaptureDomain();
+-        else if (writer)
+-            api = writer->getCaptureDomain();
+-        if (api <= 0)
+-            return -1.0;
+-        return (double)api;
+-    }
+     if (!iwriter.empty())
+         return iwriter->getProperty(propId);
+     return 0.;
+ }
+ 
+-String VideoWriter::getBackendName() const
+-{
+-    int api = 0;
+-    if (iwriter)
+-        api = iwriter->getCaptureDomain();
+-    else if (writer)
+-        api = writer->getCaptureDomain();
+-    CV_Assert(api != 0);
+-    return cv::videoio_registry::getBackendName((VideoCaptureAPIs)api);
+-}
+-
+ void VideoWriter::write(const Mat& image)
+ {
+-    CV_INSTRUMENT_REGION();
+-
+     if( iwriter )
+         iwriter->write(image);
+     else
+     {
+-        IplImage _img = cvIplImage(image);
++        IplImage _img = image;
+         cvWriteFrame(writer, &_img);
+     }
+ }
+ 
+ VideoWriter& VideoWriter::operator << (const Mat& image)
+ {
+-    CV_INSTRUMENT_REGION();
+-
+     write(image);
+     return *this;
+ }
+ 
+-// FIXIT OpenCV 4.0: make inline
+ int VideoWriter::fourcc(char c1, char c2, char c3, char c4)
+ {
+     return (c1 & 255) + ((c2 & 255) << 8) + ((c3 & 255) << 16) + ((c4 & 255) << 24);
+ }
+ 
+-} // namespace
++}
+diff --git a/src/opencv-3.4.14/modules/videoio/src/cap_dshow.cpp b/src/opencv-3.4.14/modules/videoio/src/cap_dshow.cpp
+index cf653f6..fae806c 100644
+--- a/src/opencv-3.4.14/modules/videoio/src/cap_dshow.cpp
++++ b/src/opencv-3.4.14/modules/videoio/src/cap_dshow.cpp
+@@ -41,7 +41,7 @@
+ 
+ #include "precomp.hpp"
+ 
+-#if defined _WIN32 && defined HAVE_DSHOW
++#if (defined WIN32 || defined _WIN32) && defined HAVE_DSHOW
+ #include "cap_dshow.hpp"
+ 
+ /*
+@@ -108,12 +108,55 @@ Thanks to:
+ #include <vector>
+ 
+ //Include Directshow stuff here so we don't worry about needing all the h files.
+-#define NO_DSHOW_STRSAFE
+-#include "DShow.h"
+-#include "strmif.h"
+-#include "Aviriff.h"
+-#include "dvdmedia.h"
+-#include "bdaiface.h"
++#if defined _MSC_VER && _MSC_VER >= 1500
++#  include "DShow.h"
++#  include "strmif.h"
++#  include "Aviriff.h"
++#  include "dvdmedia.h"
++#  include "bdaiface.h"
++#else
++#  ifdef _MSC_VER
++#  define __extension__
++   typedef BOOL WINBOOL;
++#endif
++
++#include "dshow/dshow.h"
++#include "dshow/dvdmedia.h"
++#include "dshow/bdatypes.h"
++
++interface IEnumPIDMap : public IUnknown
++{
++public:
++    virtual HRESULT STDMETHODCALLTYPE Next(
++        /* [in] */ ULONG cRequest,
++        /* [size_is][out][in] */ PID_MAP *pPIDMap,
++        /* [out] */ ULONG *pcReceived) = 0;
++
++    virtual HRESULT STDMETHODCALLTYPE Skip(
++        /* [in] */ ULONG cRecords) = 0;
++
++    virtual HRESULT STDMETHODCALLTYPE Reset( void) = 0;
++
++    virtual HRESULT STDMETHODCALLTYPE Clone(
++        /* [out] */ IEnumPIDMap **ppIEnumPIDMap) = 0;
++};
++
++interface IMPEG2PIDMap : public IUnknown
++{
++    virtual HRESULT STDMETHODCALLTYPE MapPID(
++        /* [in] */ ULONG culPID,
++        /* [in] */ ULONG *pulPID,
++        /* [in] */ MEDIA_SAMPLE_CONTENT MediaSampleContent) = 0;
++
++    virtual HRESULT STDMETHODCALLTYPE UnmapPID(
++        /* [in] */ ULONG culPID,
++        /* [in] */ ULONG *pulPID) = 0;
++
++    virtual HRESULT STDMETHODCALLTYPE EnumPIDMap(
++        /* [out] */ IEnumPIDMap **pIEnumPIDMap) = 0;
++};
++
++#endif
+ 
+ //for threading
+ #include <process.h>
+@@ -142,10 +185,6 @@ DEFINE_GUID(MEDIASUBTYPE_Y8, 0x20203859, 0x0000, 0x0010, 0x80, 0x00,
+     0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
+ DEFINE_GUID(MEDIASUBTYPE_Y800, 0x30303859, 0x0000, 0x0010, 0x80, 0x00,
+     0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
+-DEFINE_GUID(MEDIASUBTYPE_Y16, 0x20363159, 0x0000, 0x0010, 0x80, 0x00,
+-    0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71);
+-DEFINE_GUID(MEDIASUBTYPE_BY8, 0x20385942, 0x0000, 0x0010, 0x80, 0x00,
+-    0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
+ 
+ DEFINE_GUID(CLSID_CaptureGraphBuilder2,0xbf87b6e1,0x8c27,0x11d0,0xb3,0xf0,0x00,0xaa,0x00,0x37,0x61,0xc5);
+ DEFINE_GUID(CLSID_FilterGraph,0xe436ebb3,0x524f,0x11ce,0x9f,0x53,0x00,0x20,0xaf,0x0b,0xa7,0x70);
+@@ -165,7 +204,6 @@ DEFINE_GUID(IID_ICreateDevEnum,0x29840822,0x5b84,0x11d0,0xbd,0x3b,0x00,0xa0,0xc9
+ DEFINE_GUID(IID_IGraphBuilder,0x56a868a9,0x0ad4,0x11ce,0xb0,0x3a,0x00,0x20,0xaf,0x0b,0xa7,0x70);
+ DEFINE_GUID(IID_IMPEG2PIDMap,0xafb6c2a1,0x2c41,0x11d3,0x8a,0x60,0x00,0x00,0xf8,0x1e,0x0e,0x4a);
+ DEFINE_GUID(IID_IMediaControl,0x56a868b1,0x0ad4,0x11ce,0xb0,0x3a,0x00,0x20,0xaf,0x0b,0xa7,0x70);
+-DEFINE_GUID(IID_IMediaEventEx, 0x56a868c0,0x0ad4,0x11ce,0xb0,0x3a,0x00,0x20,0xaf,0x0b,0xa7,0x70);
+ DEFINE_GUID(IID_IMediaFilter,0x56a86899,0x0ad4,0x11ce,0xb0,0x3a,0x00,0x20,0xaf,0x0b,0xa7,0x70);
+ DEFINE_GUID(IID_ISampleGrabber,0x6b652fff,0x11fe,0x4fce,0x92,0xad,0x02,0x66,0xb5,0xd7,0xc7,0x8f);
+ DEFINE_GUID(LOOK_UPSTREAM_ONLY,0xac798be0,0x98e3,0x11d1,0xb3,0xf1,0x00,0xaa,0x00,0x37,0x61,0xc5);
+@@ -262,7 +300,7 @@ interface ISampleGrabber : public IUnknown
+     //optionally setup a second (or third, fourth ...) device - same options as above
+     VI.setupDevice(device2);
+ 
+-    //As requested width and height can not always be accommodated
++    //As requested width and height can not always be accomodated
+     //make sure to check the size once the device is setup
+ 
+     int width   = VI.getWidth(device1);
+@@ -298,17 +336,11 @@ interface ISampleGrabber : public IUnknown
+ #ifdef _DEBUG
+ #include <strsafe.h>
+ 
++//change for verbose debug info
++static bool gs_verbose = true;
++
+ static void DebugPrintOut(const char *format, ...)
+ {
+-    static int gs_verbose = -1;
+-    if (gs_verbose < 0)
+-    {
+-        // Fetch initial debug state from environment - defaults to disabled
+-        const char* s = getenv("OPENCV_DSHOW_DEBUG");
+-        gs_verbose = s != NULL && atoi(s) != 0;
+-    }
+-
+-
+     if (gs_verbose)
+     {
+         va_list args;
+@@ -338,7 +370,7 @@ static void DebugPrintOut(const char *format, ...)
+ //videoInput defines
+ #define VI_VERSION      0.1995
+ #define VI_MAX_CAMERAS  20
+-#define VI_NUM_TYPES    22 //MGB
++#define VI_NUM_TYPES    20 //MGB
+ #define VI_NUM_FORMATS  18 //DON'T TOUCH
+ 
+ //defines for setPhyCon - tuner is not as well supported as composite and s-video
+@@ -432,7 +464,6 @@ class videoDevice{
+         bool setupStarted;
+         bool specificFormat;
+         bool autoReconnect;
+-        bool convertRGB;
+         int  nFramesForReconnect;
+         unsigned long nFramesRunning;
+         int  connection;
+@@ -440,8 +471,6 @@ class videoDevice{
+         int  myID;
+         long requestedFrameTime; //ie fps
+ 
+-        LONG volatile property_window_count;
+-
+         char  nDeviceName[255];
+         WCHAR wDeviceName[255];
+ 
+@@ -457,6 +486,9 @@ class videoInput{
+         videoInput();
+         ~videoInput();
+ 
++        //turns off console messages - default is to print messages
++        static void setVerbose(bool _verbose);
++
+         //Functions in rough order they should be used.
+         static int listDevices(bool silent = false);
+ 
+@@ -481,7 +513,7 @@ class videoInput{
+         bool setupDeviceFourcc(int deviceID, int w, int h,int fourcc);
+ 
+         //These two are only for capture cards
+-        //USB and Firewire cameras shouldn't specify connection
++        //USB and Firewire cameras souldn't specify connection
+         bool setupDevice(int deviceID, int connection);
+         bool setupDevice(int deviceID, int w, int h, int connection);
+ 
+@@ -507,7 +539,7 @@ class videoInput{
+ 
+         //Launches a pop up settings window
+         //For some reason in GLUT you have to call it twice each time.
+-        bool showSettingsWindow(int deviceID);
++        void showSettingsWindow(int deviceID);
+ 
+         //Manual control over settings thanks.....
+         //These are experimental for now.
+@@ -528,12 +560,6 @@ class videoInput{
+         int  getFourcc(int deviceID) const;
+         double getFPS(int deviceID) const;
+ 
+-        int getChannel(int deviceID) const;
+-
+-        // RGB conversion setting
+-        bool getConvertRGB(int deviceID);
+-        bool setConvertRGB(int deviceID, bool enable);
+-
+         //completely stops and frees a device
+         void stopDevice(int deviceID);
+ 
+@@ -547,17 +573,11 @@ class videoInput{
+         int getVideoPropertyFromCV(int cv_property);
+         int getCameraPropertyFromCV(int cv_property);
+ 
+-        bool isDeviceDisconnected(int deviceID);
+-
+-        int property_window_count(int device_idx);
+-
+-        GUID getMediasubtype(int deviceID);
+-
+     private:
+         void setPhyCon(int deviceID, int conn);
+         void setAttemptCaptureSize(int deviceID, int w, int h,GUID mediaType=MEDIASUBTYPE_RGB24);
+         bool setup(int deviceID);
+-        void processPixels(unsigned char * src, unsigned char * dst, int width, int height, bool bRGB, bool bFlip, int bytesperpixel = 3);
++        void processPixels(unsigned char * src, unsigned char * dst, int width, int height, bool bRGB, bool bFlip);
+         int  start(int deviceID, videoDevice * VD);
+         int  getDeviceCount();
+         void getMediaSubtypeAsString(GUID type, char * typeAsString);
+@@ -585,9 +605,9 @@ class videoInput{
+         GUID CAPTURE_MODE;
+ 
+         //Extra video subtypes
+-        // GUID MEDIASUBTYPE_Y800;
+-        // GUID MEDIASUBTYPE_Y8;
+-        // GUID MEDIASUBTYPE_GREY;
++        GUID MEDIASUBTYPE_Y800;
++        GUID MEDIASUBTYPE_Y8;
++        GUID MEDIASUBTYPE_GREY;
+ 
+         videoDevice * VDList[VI_MAX_CAMERAS];
+         GUID mediaSubtypes[VI_NUM_TYPES];
+@@ -596,28 +616,11 @@ class videoInput{
+         static void __cdecl basicThread(void * objPtr);
+ 
+         static char deviceNames[VI_MAX_CAMERAS][255];
++
+ };
+ 
+ ///////////////////////////  HANDY FUNCTIONS  /////////////////////////////
+ 
+-//Included by e-con
+-//Checks whether the current formattype is single byte format
+-//Eg: MEDIASUBTYPE_Y800, MEDIASUBTYPE_Y8, MEDIASUBTYPE_GREY
+-static bool checkSingleByteFormat(GUID formatType)
+-{
+-
+-    if (formatType == MEDIASUBTYPE_Y800 ||
+-        formatType == MEDIASUBTYPE_Y8 ||
+-        formatType == MEDIASUBTYPE_GREY)
+-    {
+-        return true;
+-    }
+-    else
+-    {
+-        return false;
+-    }
+-}
+-
+ static void MyFreeMediaType(AM_MEDIA_TYPE& mt){
+     if (mt.cbFormat != 0)
+     {
+@@ -627,7 +630,7 @@ static void MyFreeMediaType(AM_MEDIA_TYPE& mt){
+     }
+     if (mt.pUnk != NULL)
+     {
+-        // Unnecessary because pUnk should not be used, but safest.
++        // Unecessary because pUnk should not be used, but safest.
+         mt.pUnk->Release();
+         mt.pUnk = NULL;
+     }
+@@ -659,9 +662,6 @@ public:
+         latestBufferLength  = 0;
+ 
+         hEvent = CreateEvent(NULL, true, false, NULL);
+-        pixels = 0;
+-        ptrBuffer = 0;
+-        numBytes = 0;
+     }
+ 
+ 
+@@ -793,15 +793,8 @@ videoDevice::videoDevice(){
+      setupStarted       = false;
+      specificFormat     = false;
+      autoReconnect      = false;
+-     convertRGB         = true;
+      requestedFrameTime = -1;
+ 
+-     pBuffer = 0;
+-     pixels = 0;
+-     formatType = 0;
+-
+-     property_window_count = 0;
+-
+      memset(wDeviceName, 0, sizeof(WCHAR) * 255);
+      memset(nDeviceName, 0, sizeof(char) * 255);
+ 
+@@ -821,20 +814,7 @@ void videoDevice::setSize(int w, int h){
+     {
+         width               = w;
+         height              = h;
+-
+-        if (checkSingleByteFormat(pAmMediaType->subtype))
+-        {
+-            videoSize      = w * h;
+-        }
+-        else if (pAmMediaType->subtype == MEDIASUBTYPE_Y16)
+-        {
+-            videoSize      = w * h * 2;
+-        }
+-        else
+-        {
+-            videoSize      = w * h * 3;
+-        }
+-
++        videoSize           = w*h*3;
+         sizeSet             = true;
+         pixels              = new unsigned char[videoSize];
+         pBuffer             = new char[videoSize];
+@@ -857,8 +837,6 @@ void videoDevice::NukeDownstream(IBaseFilter *pBF){
+     IEnumPins *pins = NULL;
+     PIN_INFO pininfo;
+     HRESULT hr = pBF->EnumPins(&pins);
+-    if (hr != S_OK || !pins)
+-        return;
+     pins->Reset();
+     while (hr == NOERROR)
+     {
+@@ -886,7 +864,7 @@ void videoDevice::NukeDownstream(IBaseFilter *pBF){
+             pP->Release();
+         }
+     }
+-    pins->Release();
++    if (pins) pins->Release();
+ }
+ 
+ 
+@@ -896,12 +874,14 @@ void videoDevice::NukeDownstream(IBaseFilter *pBF){
+ 
+ void videoDevice::destroyGraph(){
+     HRESULT hr = 0;
++     //int FuncRetval=0;
++     //int NumFilters=0;
+ 
+     int i = 0;
+     while (hr == NOERROR)
+     {
+         IEnumFilters * pEnum = 0;
+-        ULONG cFetched = 0;
++        ULONG cFetched;
+ 
+         // We must get the enumerator again every time because removing a filter from the graph
+         // invalidates the enumerator. We always get only the first filter from each enumerator.
+@@ -934,11 +914,9 @@ void videoDevice::destroyGraph(){
+             pFilter->Release();
+             pFilter = NULL;
+         }
++        else break;
+         pEnum->Release();
+         pEnum = NULL;
+-
+-        if (cFetched == 0)
+-            break;
+         i++;
+     }
+ 
+@@ -965,16 +943,6 @@ videoDevice::~videoDevice(){
+ 
+     HRESULT HR = NOERROR;
+ 
+-    //Check to see if the graph is running, if so stop it.
+-    if( (pControl) )
+-    {
+-        HR = pControl->Pause();
+-        if (FAILED(HR)) DebugPrintOut("ERROR - Could not pause pControl\n");
+-
+-        HR = pControl->Stop();
+-        if (FAILED(HR)) DebugPrintOut("ERROR - Could not stop pControl\n");
+-    }
+-
+     //Stop the callback and free it
+     if( (sgCallback) && (pGrabber) )
+     {
+@@ -991,6 +959,16 @@ videoDevice::~videoDevice(){
+         delete sgCallback;
+     }
+ 
++    //Check to see if the graph is running, if so stop it.
++     if( (pControl) )
++    {
++        HR = pControl->Pause();
++        if (FAILED(HR)) DebugPrintOut("ERROR - Could not pause pControl\n");
++
++        HR = pControl->Stop();
++        if (FAILED(HR)) DebugPrintOut("ERROR - Could not stop pControl\n");
++    }
++
+     //Disconnect filters from capture device
+     if( (pVideoInputFilter) )NukeDownstream(pVideoInputFilter);
+ 
+@@ -1047,6 +1025,17 @@ videoDevice::~videoDevice(){
+                                 (pGraph) = 0;
+     }
+ 
++    //delete our pointers
++    delete pDestFilter;
++    delete pVideoInputFilter;
++    delete pGrabberF;
++    delete pGrabber;
++    delete pControl;
++    delete streamConf;
++    delete pMediaEvent;
++    delete pCaptureGraph;
++    delete pGraph;
++
+     DebugPrintOut("SETUP: Device %i disconnected and freed\n\n",myID);
+ }
+ 
+@@ -1068,18 +1057,15 @@ videoInput::videoInput(){
+     callbackSetCount     = 0;
+     bCallback            = true;
+ 
+-    connection = PhysConn_Video_Composite;
+-    CAPTURE_MODE = PIN_CATEGORY_PREVIEW;
+-
+     //setup a max no of device objects
+     for(int i=0; i<VI_MAX_CAMERAS; i++)  VDList[i] = new videoDevice();
+ 
+     DebugPrintOut("\n***** VIDEOINPUT LIBRARY - %2.04f - TFW07 *****\n\n",VI_VERSION);
+ 
+     //added for the pixelink firewire camera
+-    // MEDIASUBTYPE_Y800 = (GUID)FOURCCMap(FCC('Y800'));
+-    // MEDIASUBTYPE_Y8   = (GUID)FOURCCMap(FCC('Y8'));
+-    // MEDIASUBTYPE_GREY = (GUID)FOURCCMap(FCC('GREY'));
++     //MEDIASUBTYPE_Y800 = (GUID)FOURCCMap(FCC('Y800'));
++     //MEDIASUBTYPE_Y8   = (GUID)FOURCCMap(FCC('Y8'));
++     //MEDIASUBTYPE_GREY = (GUID)FOURCCMap(FCC('GREY'));
+ 
+     //The video types we support
+     //in order of preference
+@@ -1106,8 +1092,6 @@ videoInput::videoInput(){
+     mediaSubtypes[17]    = MEDIASUBTYPE_Y8;
+     mediaSubtypes[18]    = MEDIASUBTYPE_GREY;
+     mediaSubtypes[19]    = MEDIASUBTYPE_I420;
+-    mediaSubtypes[20] = MEDIASUBTYPE_BY8;
+-    mediaSubtypes[21] = MEDIASUBTYPE_Y16;
+ 
+     //The video formats we support
+     formatTypes[VI_NTSC_M]      = AnalogVideo_NTSC_M;
+@@ -1133,6 +1117,20 @@ videoInput::videoInput(){
+ 
+ }
+ 
++
++// ----------------------------------------------------------------------
++// static - set whether messages get printed to console or not
++//
++// ----------------------------------------------------------------------
++
++void videoInput::setVerbose(bool _verbose){
++#ifdef _DEBUG
++    gs_verbose = _verbose;
++#else
++    (void)_verbose; // Suppress 'unreferenced parameter' warning
++#endif
++}
++
+ // ----------------------------------------------------------------------
+ // change to use callback or regular capture
+ // callback tells you when a new frame has arrived
+@@ -1229,9 +1227,6 @@ bool videoInput::setupDeviceFourcc(int deviceNumber, int w, int h,int fourcc){
+         GUID *mediaType = getMediaSubtypeFromFourcc(fourcc);
+         if ( mediaType ) {
+             setAttemptCaptureSize(deviceNumber,w,h,*mediaType);
+-        } else {
+-            DebugPrintOut("SETUP: Unknown GUID \n");
+-            return false;
+         }
+     } else {
+         setAttemptCaptureSize(deviceNumber,w,h);
+@@ -1287,7 +1282,6 @@ bool videoInput::setFormat(int deviceNumber, int format){
+             if(VDList[deviceNumber]->pVideoInputFilter)VDList[deviceNumber]->pVideoInputFilter->Release();
+             if(VDList[deviceNumber]->pVideoInputFilter)VDList[deviceNumber]->pVideoInputFilter = NULL;
+ 
+-
+             if(FAILED(hr)){
+                 DebugPrintOut("SETUP: couldn't set requested format\n");
+             }else{
+@@ -1334,7 +1328,7 @@ char * videoInput::getDeviceName(int deviceID){
+ 
+ int videoInput::listDevices(bool silent){
+ 
+-    //COM Library Initialization
++    //COM Library Intialization
+     comInit();
+ 
+     if(!silent) DebugPrintOut("\nVIDEOINPUT SPY MODE!\n\n");
+@@ -1482,12 +1476,6 @@ double videoInput::getFPS(int id) const
+ 
+ }
+ 
+-int videoInput::getChannel(int deviceID) const
+-{
+-    if (!isDeviceSetup(deviceID))
+-        return 0;
+-    return VDList[deviceID]->storeConn;
+-}
+ 
+ // ----------------------------------------------------------------------
+ //
+@@ -1505,37 +1493,6 @@ int videoInput::getSize(int id) const
+ 
+ }
+ 
+-// ----------------------------------------------------------------------
+-//
+-//
+-// ----------------------------------------------------------------------
+-
+-bool videoInput::getConvertRGB(int id)
+-{
+-    if (isDeviceSetup(id))
+-    {
+-        return VDList[id]->convertRGB;
+-    }
+-    else
+-    {
+-        return false;
+-    }
+-
+-}
+-
+-bool videoInput::setConvertRGB(int id, bool enable)
+-{
+-    if (isDeviceSetup(id))
+-    {
+-        VDList[id]->convertRGB = enable;
+-        return true;
+-    }
+-    else
+-    {
+-        return false;
+-    }
+-}
+-
+ 
+ // ----------------------------------------------------------------------
+ // Uses a supplied buffer
+@@ -1560,24 +1517,7 @@ bool videoInput::getPixels(int id, unsigned char * dstBuffer, bool flipRedAndBlu
+                 int height             = VDList[id]->height;
+                 int width              = VDList[id]->width;
+ 
+-                // Conditional processing for 8/16-bit images (e-Con systems)
+-                if (checkSingleByteFormat(VDList[id]->pAmMediaType->subtype))
+-                {
+-                    memcpy(dst, src, width * height);
+-                }
+-                else if (VDList[id]->pAmMediaType->subtype == MEDIASUBTYPE_Y16)
+-                {
+-                    if (!VDList[id]->convertRGB) {
+-                        memcpy(dst, src, width * height * 2);
+-                    }
+-                    else {
+-                        processPixels(src, dst, width, height, flipRedAndBlue, flipImage, 2);
+-                    }
+-                }
+-                else
+-                {
+-                    processPixels(src, dst, width, height, flipRedAndBlue, flipImage);
+-                }
++                processPixels(src, dst, width, height, flipRedAndBlue, flipImage);
+                 VDList[id]->sgCallback->newFrame = false;
+ 
+             LeaveCriticalSection(&VDList[id]->sgCallback->critSection);
+@@ -1644,7 +1584,7 @@ bool videoInput::isFrameNew(int id){
+     EnterCriticalSection(&VDList[id]->sgCallback->critSection);
+         result = VDList[id]->sgCallback->newFrame;
+ 
+-        //we need to give it some time at the beginning to start up so lets check after 400 frames
++        //we need to give it some time at the begining to start up so lets check after 400 frames
+         if(VDList[id]->nFramesRunning > 400 && VDList[id]->sgCallback->freezeCheck > VDList[id]->nFramesForReconnect ){
+             freeze = true;
+         }
+@@ -1684,51 +1624,40 @@ bool videoInput::isDeviceSetup(int id) const
+ 
+ // ----------------------------------------------------------------------
+ // Gives us a little pop up window to adjust settings
+-// We do this in a separate thread now!
++// We do this in a seperate thread now!
+ // ----------------------------------------------------------------------
+ 
+ 
++void __cdecl videoInput::basicThread(void * objPtr){
++
++    //get a reference to the video device
++    //not a copy as we need to free the filter
++    videoDevice * vd = *( (videoDevice **)(objPtr) );
++    ShowFilterPropertyPages(vd->pVideoInputFilter);
++
+ 
+-void __cdecl videoInput::basicThread(void* ptr)
+-{
+-    videoDevice* dev = (videoDevice*) ptr;
+-    IBaseFilter* filter = dev->pVideoInputFilter;
+ 
+-    (void) ShowFilterPropertyPages(filter);
+-    (void) InterlockedDecrement(&dev->property_window_count);
++    //now we free the filter and make sure it set to NULL
++    if(vd->pVideoInputFilter)vd->pVideoInputFilter->Release();
++    if(vd->pVideoInputFilter)vd->pVideoInputFilter = NULL;
++
++    return;
+ }
+ 
+-bool videoInput::showSettingsWindow(int id){
++void videoInput::showSettingsWindow(int id){
++
+     if(isDeviceSetup(id)){
+         //HANDLE myTempThread;
+ 
+         //we reconnect to the device as we have freed our reference to it
+         //why have we freed our reference? because there seemed to be an issue
+         //with some mpeg devices if we didn't
+-
+-        // XXX TODO compare fourcc for mpeg devices? is this comment still valid? -sh 20180104
+-
+-        videoDevice* dev = VDList[id];
+-        HRESULT hr = getDevice(&dev->pVideoInputFilter, id, dev->wDeviceName, dev->nDeviceName);
+-        if(hr == S_OK)
+-        {
+-            // it's pointless to keep the filter around. it crashes in
+-            // pGraph or ISampleGrabber anyway
+-            //dev->pVideoInputFilter->AddRef();
+-
+-            int new_window_count = InterlockedIncrement(&dev->property_window_count);
+-            // don't open multiple property windows at a time.
+-            // will cause the camera to confuse itself anyway.
+-            if (new_window_count == 1)
+-            {
+-                _beginthread(basicThread, 0, dev);
+-                return true;
+-            }
+-            else
+-                (void) InterlockedDecrement(&dev->property_window_count);
++        HRESULT hr = getDevice(&VDList[id]->pVideoInputFilter, id, VDList[id]->wDeviceName, VDList[id]->nDeviceName);
++        if(hr == S_OK){
++            //myTempThread = (HANDLE)
++                _beginthread(basicThread, 0, (void *)&VDList[id]);
+         }
+     }
+-    return false;
+ }
+ 
+ 
+@@ -1750,12 +1679,10 @@ bool videoInput::getVideoSettingFilter(int deviceID, long Property, long &min, l
+     IAMVideoProcAmp *pAMVideoProcAmp = NULL;
+ 
+     hr = VD->pVideoInputFilter->QueryInterface(IID_IAMVideoProcAmp, (void**)&pAMVideoProcAmp);
+-    if(FAILED(hr) || !pAMVideoProcAmp){
++    if(FAILED(hr)){
+         DebugPrintOut("setVideoSetting - QueryInterface Error\n");
+-#if 0
+         if(VD->pVideoInputFilter)VD->pVideoInputFilter->Release();
+         if(VD->pVideoInputFilter)VD->pVideoInputFilter = NULL;
+-#endif
+         return false;
+     }
+ 
+@@ -1764,21 +1691,16 @@ bool videoInput::getVideoSettingFilter(int deviceID, long Property, long &min, l
+ 
+     DebugPrintOut("Setting video setting %s.\n", propStr);
+ 
+-    //both GetRange() and Get() will fail if the device doesn't support this property
+-    hr = pAMVideoProcAmp->GetRange(Property, &min, &max, &SteppingDelta, &defaultValue, &flags);
+-    if (SUCCEEDED(hr))
+-    {
+-        DebugPrintOut("Range for video setting %s: Min:%ld Max:%ld SteppingDelta:%ld Default:%ld Flags:%ld\n", propStr, min, max, SteppingDelta, defaultValue, flags);
+-        hr = pAMVideoProcAmp->Get(Property, &currentValue, &flags);
+-    }
++    pAMVideoProcAmp->GetRange(Property, &min, &max, &SteppingDelta, &defaultValue, &flags);
++    DebugPrintOut("Range for video setting %s: Min:%ld Max:%ld SteppingDelta:%ld Default:%ld Flags:%ld\n", propStr, min, max, SteppingDelta, defaultValue, flags);
++    pAMVideoProcAmp->Get(Property, &currentValue, &flags);
+ 
+-    pAMVideoProcAmp->Release();
+-#if 0
++    if(pAMVideoProcAmp)pAMVideoProcAmp->Release();
+     if(VD->pVideoInputFilter)VD->pVideoInputFilter->Release();
+     if(VD->pVideoInputFilter)VD->pVideoInputFilter = NULL;
+-#endif
+ 
+-    return SUCCEEDED(hr);
++    return true;
++
+ }
+ 
+ 
+@@ -1841,10 +1763,8 @@ bool videoInput::setVideoSettingFilter(int deviceID, long Property, long lValue,
+     hr = VD->pVideoInputFilter->QueryInterface(IID_IAMVideoProcAmp, (void**)&pAMVideoProcAmp);
+     if(FAILED(hr)){
+         DebugPrintOut("setVideoSetting - QueryInterface Error\n");
+-#if 0
+         if(VD->pVideoInputFilter)VD->pVideoInputFilter->Release();
+         if(VD->pVideoInputFilter)VD->pVideoInputFilter = NULL;
+-#endif
+         return false;
+     }
+ 
+@@ -1859,20 +1779,18 @@ bool videoInput::setVideoSettingFilter(int deviceID, long Property, long lValue,
+     DebugPrintOut("Current value: %ld Flags %ld (%s)\n", CurrVal, CapsFlags, (CapsFlags == 1 ? "Auto" : (CapsFlags == 2 ? "Manual" : "Unknown")));
+ 
+     if (useDefaultValue) {
+-        hr = pAMVideoProcAmp->Set(Property, Default, VideoProcAmp_Flags_Auto);
++        pAMVideoProcAmp->Set(Property, Default, VideoProcAmp_Flags_Auto);
+     }
+     else{
+-        // Perhaps add a check that lValue and Flags are within the range acquired from GetRange above
+-        hr = pAMVideoProcAmp->Set(Property, lValue, Flags);
++        // Perhaps add a check that lValue and Flags are within the range aquired from GetRange above
++        pAMVideoProcAmp->Set(Property, lValue, Flags);
+     }
+ 
+     if(pAMVideoProcAmp)pAMVideoProcAmp->Release();
+-#if 0
+     if(VD->pVideoInputFilter)VD->pVideoInputFilter->Release();
+     if(VD->pVideoInputFilter)VD->pVideoInputFilter = NULL;
+-#endif
+ 
+-    return SUCCEEDED(hr);
++    return true;
+ 
+ }
+ 
+@@ -1926,10 +1844,8 @@ bool videoInput::setVideoSettingCamera(int deviceID, long Property, long lValue,
+         hr = VDList[deviceID]->pVideoInputFilter->QueryInterface(IID_IAMCameraControl, (void**)&pIAMCameraControl);
+         if (FAILED(hr)) {
+             DebugPrintOut("Error\n");
+-#if 0
+             if(VDList[deviceID]->pVideoInputFilter)VDList[deviceID]->pVideoInputFilter->Release();
+             if(VDList[deviceID]->pVideoInputFilter)VDList[deviceID]->pVideoInputFilter = NULL;
+-#endif
+             return false;
+         }
+         else
+@@ -1940,19 +1856,17 @@ bool videoInput::setVideoSettingCamera(int deviceID, long Property, long lValue,
+             pIAMCameraControl->Get(Property, &CurrVal, &CapsFlags);
+             DebugPrintOut("Current value: %ld Flags %ld (%s)\n", CurrVal, CapsFlags, (CapsFlags == 1 ? "Auto" : (CapsFlags == 2 ? "Manual" : "Unknown")));
+             if (useDefaultValue) {
+-                hr = pIAMCameraControl->Set(Property, Default, CameraControl_Flags_Auto);
++                pIAMCameraControl->Set(Property, Default, CameraControl_Flags_Auto);
+             }
+             else
+             {
+-                // Perhaps add a check that lValue and Flags are within the range acquired from GetRange above
+-                hr = pIAMCameraControl->Set(Property, lValue, Flags);
++                // Perhaps add a check that lValue and Flags are within the range aquired from GetRange above
++                pIAMCameraControl->Set(Property, lValue, Flags);
+             }
+             pIAMCameraControl->Release();
+-#if 0
+             if(VDList[deviceID]->pVideoInputFilter)VDList[deviceID]->pVideoInputFilter->Release();
+             if(VDList[deviceID]->pVideoInputFilter)VDList[deviceID]->pVideoInputFilter = NULL;
+-#endif
+-            return SUCCEEDED(hr);
++            return true;
+         }
+     }
+     return false;
+@@ -1977,12 +1891,10 @@ bool videoInput::getVideoSettingCamera(int deviceID, long Property, long &min, l
+     IAMCameraControl *pIAMCameraControl = NULL;
+ 
+     hr = VD->pVideoInputFilter->QueryInterface(IID_IAMCameraControl, (void**)&pIAMCameraControl);
+-    if(FAILED(hr) || !pIAMCameraControl){
++    if(FAILED(hr)){
+         DebugPrintOut("setVideoSetting - QueryInterface Error\n");
+-#if 0
+         if(VD->pVideoInputFilter)VD->pVideoInputFilter->Release();
+         if(VD->pVideoInputFilter)VD->pVideoInputFilter = NULL;
+-#endif
+         return false;
+     }
+ 
+@@ -1990,21 +1902,16 @@ bool videoInput::getVideoSettingCamera(int deviceID, long Property, long &min, l
+     getCameraPropertyAsString(Property,propStr);
+     DebugPrintOut("Setting video setting %s.\n", propStr);
+ 
+-    //both GetRange() and Get() will fail if the device doesn't support this property
+-    hr = pIAMCameraControl->GetRange(Property, &min, &max, &SteppingDelta, &defaultValue, &flags);
+-    if (SUCCEEDED(hr))
+-    {
+-        DebugPrintOut("Range for video setting %s: Min:%ld Max:%ld SteppingDelta:%ld Default:%ld Flags:%ld\n", propStr, min, max, SteppingDelta, defaultValue, flags);
+-        hr = pIAMCameraControl->Get(Property, &currentValue, &flags);
+-    }
++    pIAMCameraControl->GetRange(Property, &min, &max, &SteppingDelta, &defaultValue, &flags);
++    DebugPrintOut("Range for video setting %s: Min:%ld Max:%ld SteppingDelta:%ld Default:%ld Flags:%ld\n", propStr, min, max, SteppingDelta, defaultValue, flags);
++    pIAMCameraControl->Get(Property, &currentValue, &flags);
+ 
+-    pIAMCameraControl->Release();
+-#if 0
++    if(pIAMCameraControl)pIAMCameraControl->Release();
+     if(VD->pVideoInputFilter)VD->pVideoInputFilter->Release();
+     if(VD->pVideoInputFilter)VD->pVideoInputFilter = NULL;
+-#endif
+ 
+-    return SUCCEEDED(hr);
++    return true;
++
+ }
+ 
+ 
+@@ -2073,7 +1980,7 @@ videoInput::~videoInput(){
+     {
+         delete VDList[i];
+     }
+-    //Uninitialize com
++    //Unitialize com
+     comUnInit();
+ }
+ 
+@@ -2114,7 +2021,7 @@ bool videoInput::comInit(){
+ 
+ 
+ // ----------------------------------------------------------------------
+-// Same as above but to uninitialize com, decreases counter and frees com
++// Same as above but to unitialize com, decreases counter and frees com
+ // if no one else is using it
+ // ----------------------------------------------------------------------
+ 
+@@ -2180,7 +2087,7 @@ void videoInput::setPhyCon(int id, int conn){
+ 
+ 
+ // ----------------------------------------------------------------------
+-// Check that we are not trying to setup a non-existent device
++// Check that we are not trying to setup a non-existant device
+ // Then start the graph building!
+ // ----------------------------------------------------------------------
+ 
+@@ -2211,81 +2118,62 @@ bool videoInput::setup(int deviceNumber){
+ // You have any combination of those.
+ // ----------------------------------------------------------------------
+ 
+-void videoInput::processPixels(unsigned char * src, unsigned char * dst, int width, int height, bool bRGB, bool bFlip, int bytesperpixel){
++void videoInput::processPixels(unsigned char * src, unsigned char * dst, int width, int height, bool bRGB, bool bFlip){
+ 
+-    int widthInBytes = width * bytesperpixel;
++    int widthInBytes = width * 3;
+     int numBytes = widthInBytes * height;
+ 
+-    if (bytesperpixel == 2) {
+-        for (int i = 0; i < width*height; i++) {
+-            if (bytesperpixel == 2) {
+-                *dst = (uint8_t) (*((uint16_t*) src) >> 8);
+-                dst++;
+-
+-                *dst = (uint8_t) (*((uint16_t*)src) >> 8);
+-                dst++;
++    if(!bRGB){
+ 
+-                *dst = (uint8_t) (*((uint16_t*)src) >> 8);
+-                dst++;
++        //int x = 0;
++        //int y = 0;
+ 
+-                src += 2;
++        if(bFlip){
++            for(int y = 0; y < height; y++){
++                memcpy(dst + (y * widthInBytes), src + ( (height -y -1) * widthInBytes), widthInBytes);
+             }
+-        }
+-    }
+-    else
+-    {
+-        if(!bRGB){
+-
+-            //int x = 0;
+-            //int y = 0;
+-
+-            if(bFlip){
+-                for(int y = 0; y < height; y++){
+-                    memcpy(dst + (y * widthInBytes), src + ( (height -y -1) * widthInBytes), widthInBytes);
+-                }
+ 
+-            }else{
+-                memcpy(dst, src, numBytes);
+-            }
+         }else{
+-            if(bFlip){
++            memcpy(dst, src, numBytes);
++        }
++    }else{
++        if(bFlip){
+ 
+-                int x = 0;
+-                int y = (height - 1) * widthInBytes;
+-                src += y;
++            int x = 0;
++            int y = (height - 1) * widthInBytes;
++            src += y;
+ 
+-                for(int i = 0; i < numBytes; i+=3){
+-                    if(x >= width){
+-                        x = 0;
+-                        src -= widthInBytes*2;
+-                    }
++            for(int i = 0; i < numBytes; i+=3){
++                if(x >= width){
++                    x = 0;
++                    src -= widthInBytes*2;
++                }
+ 
+-                    *dst = *(src+2);
+-                    dst++;
++                *dst = *(src+2);
++                dst++;
+ 
+-                    *dst = *(src+1);
+-                    dst++;
++                *dst = *(src+1);
++                dst++;
+ 
+-                    *dst = *src;
+-                    dst++;
++                *dst = *src;
++                dst++;
+ 
+-                    src+=3;
+-                    x++;
+-                }
++                src+=3;
++                x++;
+             }
+-            else{
+-                for(int i = 0; i < numBytes; i+=3){
+-                    *dst = *(src+2);
+-                    dst++;
++        }
++        else{
++            for(int i = 0; i < numBytes; i+=3){
++                *dst = *(src+2);
++                dst++;
+ 
+-                    *dst = *(src+1);
+-                    dst++;
++                *dst = *(src+1);
++                dst++;
+ 
+-                    *dst = *src;
+-                    dst++;
++                *dst = *src;
++                dst++;
+ 
+-                    src+=3;
+-                }
++                src+=3;
+             }
+         }
+     }
+@@ -2316,8 +2204,6 @@ void videoInput::getMediaSubtypeAsString(GUID type, char * typeAsString){
+     else if(type == MEDIASUBTYPE_Y8)    sprintf(tmpStr, "Y8");
+     else if(type == MEDIASUBTYPE_GREY)  sprintf(tmpStr, "GREY");
+     else if(type == MEDIASUBTYPE_I420)  sprintf(tmpStr, "I420");
+-    else if (type == MEDIASUBTYPE_BY8)  sprintf(tmpStr, "BY8");
+-    else if (type == MEDIASUBTYPE_Y16)  sprintf(tmpStr, "Y16");
+     else sprintf(tmpStr, "OTHER");
+ 
+     memcpy(typeAsString, tmpStr, sizeof(char)*8);
+@@ -2359,6 +2245,7 @@ void videoInput::getVideoPropertyAsString(int prop, char * propertyAsString){
+ 
+ 
+ int videoInput::getVideoPropertyFromCV(int cv_property){
++
+     // see VideoProcAmpProperty in strmif.h
+     switch (cv_property) {
+         case CV_CAP_PROP_BRIGHTNESS:
+@@ -2422,27 +2309,6 @@ int videoInput::getCameraPropertyFromCV(int cv_property){
+     return -1;
+ }
+ 
+-bool videoInput::isDeviceDisconnected(int deviceNumber)
+-{
+-    if (!isDeviceSetup(deviceNumber)) return true;
+-    long evCode;
+-    LONG_PTR param1, param2;
+-    bool disconnected = false;
+-
+-    while (S_OK == VDList[deviceNumber]->pMediaEvent->GetEvent(&evCode, &param1, &param2, 0))
+-    {
+-        DebugPrintOut("Event: Code: %#04x Params: %d, %d\n", evCode, param1, param2);
+-
+-        VDList[deviceNumber]->pMediaEvent->FreeEventParams(evCode, param1, param2);
+-        if (evCode == EC_DEVICE_LOST)
+-        {
+-           DebugPrintOut("ERROR: Device disconnected\n");
+-           disconnected = true;
+-        }
+-    }
+-    return disconnected;
+-}
+-
+ void videoInput::getCameraPropertyAsString(int prop, char * propertyAsString){
+ 
+     char tmpStr[16];
+@@ -2459,10 +2325,6 @@ void videoInput::getCameraPropertyAsString(int prop, char * propertyAsString){
+     memcpy(propertyAsString, tmpStr, sizeof(char)*16);
+ }
+ 
+-GUID videoInput::getMediasubtype(int deviceID)
+-{
+-    return VDList[deviceID]->pAmMediaType->subtype;
+-}
+ 
+ //-------------------------------------------------------------------------------------------
+ static void findClosestSizeAndSubtype(videoDevice * VD, int widthIn, int heightIn, int &widthOut, int &heightOut, GUID & mediatypeOut){
+@@ -2585,15 +2447,13 @@ static bool setSizeAndSubtype(videoDevice * VD, int attemptWidth, int attemptHei
+     VD->pAmMediaType->subtype     = mediatype;
+ 
+     //buffer size
+-    if (mediatype == MEDIASUBTYPE_RGB24){
+-        VD->pAmMediaType->lSampleSize = attemptWidth*attemptHeight * 3;
+-    }
+-    else if ((mediatype == MEDIASUBTYPE_YUY2) || (mediatype == MEDIASUBTYPE_YVYU) ||
+-        (mediatype == MEDIASUBTYPE_UYVY)){
+-
+-        VD->pAmMediaType->lSampleSize = attemptWidth*attemptHeight * 2;
++    if (mediatype == MEDIASUBTYPE_RGB24)
++    {
++        VD->pAmMediaType->lSampleSize = attemptWidth*attemptHeight*3;
+     }
+-    else{
++    else
++    {
++        // For compressed data, the value can be zero.
+         VD->pAmMediaType->lSampleSize = 0;
+     }
+ 
+@@ -2639,7 +2499,7 @@ int videoInput::start(int deviceID, videoDevice *VD){
+         return hr;
+     }
+ 
+-    //FILTER GRAPH MANAGER//
++    //FITLER GRAPH MANAGER//
+     // Create the Filter Graph Manager.
+     hr = CoCreateInstance(CLSID_FilterGraph, 0, CLSCTX_INPROC_SERVER,IID_IGraphBuilder, (void**)&VD->pGraph);
+     if (FAILED(hr))
+@@ -2649,16 +2509,6 @@ int videoInput::start(int deviceID, videoDevice *VD){
+         return hr;
+     }
+ 
+-    //MEDIA EVENT//
+-    //Used to obtain event when capture device is disconnected
+-    hr = VD->pGraph->QueryInterface(IID_IMediaEventEx, (void**)&VD->pMediaEvent);
+-    if (FAILED(hr))
+-    {
+-        DebugPrintOut("ERROR - Could not create media event object\n");
+-        stopDevice(deviceID);
+-        return hr;
+-    }
+-
+     //SET THE FILTERGRAPH//
+     hr = VD->pCaptureGraph->SetFiltergraph(VD->pGraph);
+     if (FAILED(hr))
+@@ -2716,7 +2566,7 @@ int videoInput::start(int deviceID, videoDevice *VD){
+ 
+     //we do this because webcams don't have a preview mode
+     hr = VD->pCaptureGraph->FindInterface(&CAPTURE_MODE, &MEDIATYPE_Video, VD->pVideoInputFilter, IID_IAMStreamConfig, (void **)&VD->streamConf);
+-    if(FAILED(hr) || !VD->streamConf){
++    if(FAILED(hr)){
+         DebugPrintOut("ERROR: Couldn't config the stream!\n");
+         stopDevice(deviceID);
+         return hr;
+@@ -2731,7 +2581,6 @@ int videoInput::start(int deviceID, videoDevice *VD){
+     }
+ 
+     VIDEOINFOHEADER *pVih =  reinterpret_cast<VIDEOINFOHEADER*>(VD->pAmMediaType->pbFormat);
+-    CV_Assert(pVih);
+     int currentWidth    =  HEADER(pVih)->biWidth;
+     int currentHeight    =  HEADER(pVih)->biHeight;
+ 
+@@ -2851,17 +2700,7 @@ int videoInput::start(int deviceID, videoDevice *VD){
+     ZeroMemory(&mt,sizeof(AM_MEDIA_TYPE));
+ 
+     mt.majortype     = MEDIATYPE_Video;
+-
+-    // Disable format conversion if using 8/16-bit data (e-Con systems)
+-    if (checkSingleByteFormat(VD->pAmMediaType->subtype) || (VD->pAmMediaType->subtype == MEDIASUBTYPE_Y16)) {
+-        DebugPrintOut("SETUP: Not converting frames to RGB.\n");
+-        mt.subtype = VD->pAmMediaType->subtype;
+-    }
+-    else
+-    {
+-        DebugPrintOut("SETUP: Converting frames to RGB.\n");
+-        mt.subtype = MEDIASUBTYPE_RGB24;	//Making it RGB24, does conversion from YUV to RGB
+-    }
++    mt.subtype         = MEDIASUBTYPE_RGB24;
+     mt.formattype     = FORMAT_VideoInfo;
+ 
+     //VD->pAmMediaType->subtype = VD->videoType;
+@@ -2869,8 +2708,14 @@ int videoInput::start(int deviceID, videoDevice *VD){
+ 
+     //lets try freeing our stream conf here too
+     //this will fail if the device is already running
+-    VD->streamConf->Release();
+-    VD->streamConf = NULL;
++    if(VD->streamConf){
++        VD->streamConf->Release();
++        VD->streamConf = NULL;
++    }else{
++        DebugPrintOut("ERROR: connecting device - prehaps it is already being used?\n");
++        stopDevice(deviceID);
++        return S_FALSE;
++    }
+ 
+ 
+     //NULL RENDERER//
+@@ -2938,32 +2783,14 @@ int videoInput::start(int deviceID, videoDevice *VD){
+     DebugPrintOut("SETUP: Device is setup and ready to capture.\n\n");
+     VD->readyToCapture = true;
+ 
+-    // check for optional saving the direct show graph to a file
+-    const char* graph_filename = getenv("OPENCV_DSHOW_SAVEGRAPH_FILENAME");
+-    if (graph_filename) {
+-        size_t filename_len = strlen(graph_filename);
+-        std::vector<WCHAR> wfilename(filename_len + 1);
+-        size_t len = mbstowcs(&wfilename[0], graph_filename, filename_len  + 1);
+-        CV_Assert(len == filename_len);
+-
+-        HRESULT res = SaveGraphFile(VD->pGraph, &wfilename[0]);
+-        if (SUCCEEDED(res)) {
+-            DebugPrintOut("Saved DSHOW graph to %s\n", graph_filename);
+-        } else {
+-            DebugPrintOut("Failed to save DSHOW graph to %s\n", graph_filename);
+-        }
+-    }
+-
+     //Release filters - seen someone else do this
+     //looks like it solved the freezes
+ 
+     //if we release this then we don't have access to the settings
+     //we release our video input filter but then reconnect with it
+     //each time we need to use it
+-#if 0
+     VD->pVideoInputFilter->Release();
+     VD->pVideoInputFilter = NULL;
+-#endif
+ 
+     VD->pGrabberF->Release();
+     VD->pGrabberF = NULL;
+@@ -3060,7 +2887,7 @@ HRESULT videoInput::getDevice(IBaseFilter** gottaFilter, int deviceId, WCHAR * w
+         // Enumerate the monikers.
+         IMoniker *pMoniker = NULL;
+         ULONG cFetched;
+-        while ((!done) && (pEnumCat->Next(1, &pMoniker, &cFetched) == S_OK))
++        while ((pEnumCat->Next(1, &pMoniker, &cFetched) == S_OK) && (!done))
+         {
+             if(deviceCounter == deviceId)
+             {
+@@ -3084,12 +2911,8 @@ HRESULT videoInput::getDevice(IBaseFilter** gottaFilter, int deviceId, WCHAR * w
+                                count++;
+                          }
+ 
+-                        // reuse existing filter due to webcam problems
+-                        if (*gottaFilter)
+-                            hr = S_OK;
+-                        else
+-                            // We found it, so send it back to the caller
+-                            hr = pMoniker->BindToObject(NULL, NULL, IID_IBaseFilter, (void**)gottaFilter);
++                        // We found it, so send it back to the caller
++                        hr = pMoniker->BindToObject(NULL, NULL, IID_IBaseFilter, (void**)gottaFilter);
+                         done = true;
+                     }
+                     VariantClear(&varName);
+@@ -3099,12 +2922,6 @@ HRESULT videoInput::getDevice(IBaseFilter** gottaFilter, int deviceId, WCHAR * w
+                     pMoniker = NULL;
+                 }
+             }
+-            else
+-            {
+-                // cleaning for the case when this isn't the device we are looking for
+-                pMoniker->Release();
+-                pMoniker = NULL;
+-            }
+             deviceCounter++;
+         }
+         pEnumCat->Release();
+@@ -3235,7 +3052,7 @@ HRESULT videoInput::routeCrossbar(ICaptureGraphBuilder2 **ppBuild, IBaseFilter *
+     IAMCrossbar *pXBar1 = NULL;
+     HRESULT hr = pBuild->FindInterface(&LOOK_UPSTREAM_ONLY, NULL, pVidFilter,
+             IID_IAMCrossbar, (void**)&pXBar1);
+-    if (SUCCEEDED(hr) && pXBar1)
++    if (SUCCEEDED(hr))
+     {
+ 
+         bool foundDevice = false;
+@@ -3298,13 +3115,17 @@ HRESULT videoInput::routeCrossbar(ICaptureGraphBuilder2 **ppBuild, IBaseFilter *
+             }
+             Crossbar->Route(pOIndex,pIndex);
+         }else{
+-            DebugPrintOut("SETUP: Didn't find specified Physical Connection type. Using Default.\n");
++            DebugPrintOut("SETUP: Didn't find specified Physical Connection type. Using Defualt.\n");
+         }
+ 
+         //we only free the crossbar when we close or restart the device
+         //we were getting a crash otherwise
+         //if(Crossbar)Crossbar->Release();
+         //if(Crossbar)Crossbar = NULL;
++
++        if(pXBar1)pXBar1->Release();
++        if(pXBar1)pXBar1 = NULL;
++
+     }else{
+         DebugPrintOut("SETUP: You are a webcam or snazzy firewire cam! No Crossbar needed\n");
+         return hr;
+@@ -3313,14 +3134,6 @@ HRESULT videoInput::routeCrossbar(ICaptureGraphBuilder2 **ppBuild, IBaseFilter *
+     return hr;
+ }
+ 
+-int videoInput::property_window_count(int idx)
+-{
+-    if (isDeviceSetup(idx))
+-        return (int)InterlockedCompareExchange(&VDList[idx]->property_window_count, 0L, 0L);
+-
+-    return 0;
+-}
+-
+ namespace cv
+ {
+ videoInput VideoCapture_DShow::g_VI;
+@@ -3358,15 +3171,6 @@ double VideoCapture_DShow::getProperty(int propIdx) const
+         return g_VI.getFourcc(m_index);
+     case CV_CAP_PROP_FPS:
+         return g_VI.getFPS(m_index);
+-    case CV_CAP_PROP_CONVERT_RGB:
+-        return g_VI.getConvertRGB(m_index);
+-    case CAP_PROP_CHANNEL:
+-        return g_VI.getChannel(m_index);
+-    case CV_CAP_PROP_AUTOFOCUS:
+-      // Flags indicate whether or not autofocus is enabled
+-      if (g_VI.getVideoSettingCamera(m_index, CameraControl_Focus, min_value, max_value, stepping_delta, current_value, flags, defaultValue))
+-        return (double)flags;
+-      break;
+ 
+     // video filter properties
+     case CV_CAP_PROP_BRIGHTNESS:
+@@ -3381,7 +3185,6 @@ double VideoCapture_DShow::getProperty(int propIdx) const
+     case CV_CAP_PROP_GAIN:
+         if (g_VI.getVideoSettingFilter(m_index, g_VI.getVideoPropertyFromCV(propIdx), min_value, max_value, stepping_delta, current_value, flags, defaultValue))
+             return (double)current_value;
+-        break;
+ 
+     // camera properties
+     case CV_CAP_PROP_PAN:
+@@ -3393,12 +3196,8 @@ double VideoCapture_DShow::getProperty(int propIdx) const
+     case CV_CAP_PROP_FOCUS:
+         if (g_VI.getVideoSettingCamera(m_index, g_VI.getCameraPropertyFromCV(propIdx), min_value, max_value, stepping_delta, current_value, flags, defaultValue))
+             return (double)current_value;
+-        break;
+-    case CV_CAP_PROP_SETTINGS:
+-        return g_VI.property_window_count(m_index);
+-    default:
+-        break;
+     }
++
+     // unknown parameter or value not available
+     return -1;
+ }
+@@ -3420,23 +3219,15 @@ bool VideoCapture_DShow::setProperty(int propIdx, double propVal)
+ 
+     case CV_CAP_PROP_FOURCC:
+         m_fourcc = (int)(unsigned long)(propVal);
+-        m_width = (int)getProperty(CAP_PROP_FRAME_WIDTH);
+-        m_height = (int)getProperty(CAP_PROP_FRAME_HEIGHT);
+-
+         if (-1 == m_fourcc)
+         {
+             // following cvCreateVideo usage will pop up caprturepindialog here if fourcc=-1
+             // TODO - how to create a capture pin dialog
+         }
+-        else
+-        {
+-            handled = true;
+-        }
+-
++        handled = true;
+         break;
+ 
+     case CV_CAP_PROP_FPS:
+-    {
+         int fps = cvRound(propVal);
+         if (fps != g_VI.getFPS(m_index))
+         {
+@@ -3450,31 +3241,12 @@ bool VideoCapture_DShow::setProperty(int propIdx, double propVal)
+         return g_VI.isDeviceSetup(m_index);
+     }
+ 
+-    case CV_CAP_PROP_AUTOFOCUS:
+-    {
+-        // Flags are required to toggle autofocus or not, but the setProperty interface does not support multiple parameters
+-        bool enabled = cvRound(propVal) == 1;
+-        long minFocus, maxFocus, delta, currentFocus, flags, defaultValue;
+-        if (!g_VI.getVideoSettingCamera(m_index, CameraControl_Focus, minFocus, maxFocus, delta, currentFocus, flags, defaultValue))
+-        {
+-            return false;
+-        }
+-        return g_VI.setVideoSettingCamera(m_index, CameraControl_Focus, currentFocus, enabled ? CameraControl_Flags_Auto | CameraControl_Flags_Manual : CameraControl_Flags_Manual, enabled ? true : false);
+-    }
+-
+-    case CV_CAP_PROP_CONVERT_RGB:
+-    {
+-        return g_VI.setConvertRGB(m_index, cvRound(propVal) == 1);
+-    }
+-
+-    }
+-
+     if (handled)
+     {
+         // a stream setting
+         if (m_width > 0 && m_height > 0)
+         {
+-            if (m_width != g_VI.getWidth(m_index) || m_height != g_VI.getHeight(m_index) || m_fourcc != g_VI.getFourcc(m_index) )
++            if (m_width != g_VI.getWidth(m_index) || m_height != g_VI.getHeight(m_index) )//|| fourcc != VI.getFourcc(index) )
+             {
+                 int fps = static_cast<int>(g_VI.getFPS(m_index));
+                 g_VI.stopDevice(m_index);
+@@ -3485,19 +3257,22 @@ bool VideoCapture_DShow::setProperty(int propIdx, double propVal)
+             bool success = g_VI.isDeviceSetup(m_index);
+             if (success)
+             {
+-                DebugPrintOut("SETUP: Updated FourCC\n");
+                 m_widthSet = m_width;
+                 m_heightSet = m_height;
+                 m_width = m_height = m_fourcc = -1;
+             }
+-            else {
+-                DebugPrintOut("SETUP: Couldn't update FourCC\n");
+-            }
+             return success;
+         }
+         return true;
+     }
+ 
++    // show video/camera filter dialog
++    if (propIdx == CV_CAP_PROP_SETTINGS )
++    {
++        g_VI.showSettingsWindow(m_index);
++        return true;
++    }
++
+     //video Filter properties
+     switch (propIdx)
+     {
+@@ -3525,9 +3300,6 @@ bool VideoCapture_DShow::setProperty(int propIdx, double propVal)
+     case CV_CAP_PROP_IRIS:
+     case CV_CAP_PROP_FOCUS:
+         return g_VI.setVideoSettingCamera(m_index, g_VI.getCameraPropertyFromCV(propIdx), (long)propVal);
+-    // show video/camera filter dialog
+-    case CV_CAP_PROP_SETTINGS:
+-        return g_VI.showSettingsWindow(m_index);
+     }
+ 
+     return false;
+@@ -3535,22 +3307,11 @@ bool VideoCapture_DShow::setProperty(int propIdx, double propVal)
+ 
+ bool VideoCapture_DShow::grabFrame()
+ {
+-    return !g_VI.isDeviceDisconnected(m_index);
++    return true;
+ }
+ bool VideoCapture_DShow::retrieveFrame(int, OutputArray frame)
+ {
+-    int w = g_VI.getWidth(m_index), h = g_VI.getHeight(m_index);
+-    bool convertRGB = g_VI.getConvertRGB(m_index);
+-
+-    // Set suitable output matrix type (e-Con systems)
+-    if (checkSingleByteFormat(g_VI.getMediasubtype(m_index))){
+-        frame.create(Size(w, h), CV_8UC1);
+-    } else if (g_VI.getMediasubtype(m_index) == MEDIASUBTYPE_Y16 && !convertRGB) {
+-        frame.create(Size(w, h), CV_16UC1);
+-    } else {
+-        frame.create(Size(w, h), CV_8UC3);
+-    }
+-
++    frame.create(Size(g_VI.getWidth(m_index), g_VI.getHeight(m_index)), CV_8UC3);
+     cv::Mat mat = frame.getMat();
+     return g_VI.getPixels(m_index, mat.ptr(), false, true );
+ }
+@@ -3589,4 +3350,278 @@ void VideoCapture_DShow::close()
+ 
+ }
+ 
++class CvCaptureCAM_DShow : public CvCapture
++{
++public:
++    CvCaptureCAM_DShow();
++    virtual ~CvCaptureCAM_DShow();
++
++    virtual bool open( int index );
++    virtual void close();
++    virtual double getProperty(int);
++    virtual bool setProperty(int, double);
++    virtual bool grabFrame();
++    virtual IplImage* retrieveFrame(int);
++    virtual int getCaptureDomain() { return CV_CAP_DSHOW; } // Return the type of the capture object: CV_CAP_VFW, etc...
++
++protected:
++    void init();
++
++    int index, width, height,fourcc;
++    int widthSet, heightSet;
++    IplImage* frame;
++    static videoInput VI;
++};
++
++
++struct SuppressVideoInputMessages
++{
++    SuppressVideoInputMessages() { videoInput::setVerbose(false); }
++};
++
++static SuppressVideoInputMessages do_it;
++videoInput CvCaptureCAM_DShow::VI;
++
++CvCaptureCAM_DShow::CvCaptureCAM_DShow()
++{
++    index = -1;
++    frame = 0;
++    width = height = fourcc = -1;
++    widthSet = heightSet = -1;
++    CoInitialize(0);
++}
++
++CvCaptureCAM_DShow::~CvCaptureCAM_DShow()
++{
++    close();
++    CoUninitialize();
++}
++
++void CvCaptureCAM_DShow::close()
++{
++    if( index >= 0 )
++    {
++        VI.stopDevice(index);
++        index = -1;
++        cvReleaseImage(&frame);
++    }
++    widthSet = heightSet = width = height = -1;
++}
++
++// Initialize camera input
++bool CvCaptureCAM_DShow::open( int _index )
++{
++    int devices = 0;
++
++    close();
++    devices = VI.listDevices(true);
++    if (devices == 0)
++        return false;
++    if (_index < 0 || _index > devices-1)
++        return false;
++    VI.setupDevice(_index);
++    if( !VI.isDeviceSetup(_index) )
++        return false;
++    index = _index;
++    return true;
++}
++
++bool CvCaptureCAM_DShow::grabFrame()
++{
++    return true;
++}
++
++
++IplImage* CvCaptureCAM_DShow::retrieveFrame(int)
++{
++    if( !frame || VI.getWidth(index) != frame->width || VI.getHeight(index) != frame->height )
++    {
++        if (frame)
++            cvReleaseImage( &frame );
++        int w = VI.getWidth(index), h = VI.getHeight(index);
++        frame = cvCreateImage( cvSize(w,h), 8, 3 );
++    }
++
++    if (VI.getPixels( index, (uchar*)frame->imageData, false, true ))
++        return frame;
++    else
++        return NULL;
++}
++
++double CvCaptureCAM_DShow::getProperty( int property_id )
++{
++
++    long min_value,max_value,stepping_delta,current_value,flags,defaultValue;
++
++    // image format proprrties
++    switch( property_id )
++    {
++    case CV_CAP_PROP_FRAME_WIDTH:
++        return VI.getWidth(index);
++
++    case CV_CAP_PROP_FRAME_HEIGHT:
++        return VI.getHeight(index);
++
++    case CV_CAP_PROP_FOURCC:
++        return VI.getFourcc(index);
++
++    case CV_CAP_PROP_FPS:
++        return VI.getFPS(index);
++    }
++
++    // video filter properties
++    switch( property_id )
++    {
++    case CV_CAP_PROP_BRIGHTNESS:
++    case CV_CAP_PROP_CONTRAST:
++    case CV_CAP_PROP_HUE:
++    case CV_CAP_PROP_SATURATION:
++    case CV_CAP_PROP_SHARPNESS:
++    case CV_CAP_PROP_GAMMA:
++    case CV_CAP_PROP_MONOCHROME:
++    case CV_CAP_PROP_WHITE_BALANCE_BLUE_U:
++    case CV_CAP_PROP_BACKLIGHT:
++    case CV_CAP_PROP_GAIN:
++        if (VI.getVideoSettingFilter(index,VI.getVideoPropertyFromCV(property_id),min_value,max_value,stepping_delta,current_value,flags,defaultValue) ) return (double)current_value;
++    }
++
++    // camera properties
++    switch( property_id )
++    {
++    case CV_CAP_PROP_PAN:
++    case CV_CAP_PROP_TILT:
++    case CV_CAP_PROP_ROLL:
++    case CV_CAP_PROP_ZOOM:
++    case CV_CAP_PROP_EXPOSURE:
++    case CV_CAP_PROP_IRIS:
++    case CV_CAP_PROP_FOCUS:
++        if (VI.getVideoSettingCamera(index,VI.getCameraPropertyFromCV(property_id),min_value,max_value,stepping_delta,current_value,flags,defaultValue) ) return (double)current_value;
++
++    }
++
++    // unknown parameter or value not available
++    return -1;
++}
++
++bool CvCaptureCAM_DShow::setProperty( int property_id, double value )
++{
++    // image capture properties
++    bool handled = false;
++    switch( property_id )
++    {
++    case CV_CAP_PROP_FRAME_WIDTH:
++        width = cvRound(value);
++        handled = true;
++        break;
++
++    case CV_CAP_PROP_FRAME_HEIGHT:
++        height = cvRound(value);
++        handled = true;
++        break;
++
++    case CV_CAP_PROP_FOURCC:
++        fourcc = (int)(unsigned long)(value);
++        if ( fourcc == -1 ) {
++            // following cvCreateVideo usage will pop up caprturepindialog here if fourcc=-1
++            // TODO - how to create a capture pin dialog
++        }
++        handled = true;
++        break;
++
++    case CV_CAP_PROP_FPS:
++        int fps = cvRound(value);
++        if (fps != VI.getFPS(index))
++        {
++            VI.stopDevice(index);
++            VI.setIdealFramerate(index,fps);
++            if (widthSet > 0 && heightSet > 0)
++                VI.setupDevice(index, widthSet, heightSet);
++            else
++                VI.setupDevice(index);
++        }
++        return VI.isDeviceSetup(index);
++
++    }
++
++    if ( handled ) {
++        // a stream setting
++        if( width > 0 && height > 0 )
++        {
++            if( width != VI.getWidth(index) || height != VI.getHeight(index) )//|| fourcc != VI.getFourcc(index) )
++            {
++                int fps = static_cast<int>(VI.getFPS(index));
++                VI.stopDevice(index);
++                VI.setIdealFramerate(index, fps);
++                VI.setupDeviceFourcc(index, width, height, fourcc);
++            }
++
++            bool success = VI.isDeviceSetup(index);
++            if (success)
++            {
++                widthSet = width;
++                heightSet = height;
++                width = height = fourcc = -1;
++            }
++            return success;
++        }
++        return true;
++    }
++
++    // show video/camera filter dialog
++    if ( property_id == CV_CAP_PROP_SETTINGS ) {
++        VI.showSettingsWindow(index);
++        return true;
++    }
++
++    //video Filter properties
++    switch( property_id )
++    {
++    case CV_CAP_PROP_BRIGHTNESS:
++    case CV_CAP_PROP_CONTRAST:
++    case CV_CAP_PROP_HUE:
++    case CV_CAP_PROP_SATURATION:
++    case CV_CAP_PROP_SHARPNESS:
++    case CV_CAP_PROP_GAMMA:
++    case CV_CAP_PROP_MONOCHROME:
++    case CV_CAP_PROP_WHITE_BALANCE_BLUE_U:
++    case CV_CAP_PROP_BACKLIGHT:
++    case CV_CAP_PROP_GAIN:
++        return VI.setVideoSettingFilter(index,VI.getVideoPropertyFromCV(property_id),(long)value);
++    }
++
++    //camera properties
++    switch( property_id )
++    {
++    case CV_CAP_PROP_PAN:
++    case CV_CAP_PROP_TILT:
++    case CV_CAP_PROP_ROLL:
++    case CV_CAP_PROP_ZOOM:
++    case CV_CAP_PROP_EXPOSURE:
++    case CV_CAP_PROP_IRIS:
++    case CV_CAP_PROP_FOCUS:
++        return VI.setVideoSettingCamera(index,VI.getCameraPropertyFromCV(property_id),(long)value);
++    }
++
++    return false;
++}
++
++
++CvCapture* cvCreateCameraCapture_DShow( int index )
++{
++    CvCaptureCAM_DShow* capture = new CvCaptureCAM_DShow;
++
++    try
++    {
++        if( capture->open( index ))
++            return capture;
++    }
++    catch(...)
++    {
++        delete capture;
++        throw;
++    }
++
++    delete capture;
++    return 0;
++}
+ #endif
